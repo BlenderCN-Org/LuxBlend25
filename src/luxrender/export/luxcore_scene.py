@@ -33,8 +33,10 @@ import mathutils
 from ..outputs import LuxManager, LuxLog
 from ..outputs.luxcore_api import pyluxcore, ToValidLuxCoreName
 from ..export import get_worldscale
+from ..export import is_obj_visible
+from ..export import ParamSet
+from ..export import fix_matrix_order
 from ..export.materials import get_texture_from_scene
-
 
 class BlenderSceneConverter(object):
     scalers_count = 0
@@ -52,11 +54,15 @@ class BlenderSceneConverter(object):
     def clear():
         BlenderSceneConverter.scalers_count = 0
 
-    def __init__(self, blScene):
+    def __init__(self, blScene, lcSession = None):
         LuxManager.SetCurrentScene(blScene)
 
         self.blScene = blScene
-        self.lcScene = pyluxcore.Scene()
+        if lcSession:
+           self.lcScene = lcSession.GetRenderConfig().GetScene()
+        else:
+           self.lcScene = pyluxcore.Scene()
+
         self.scnProps = pyluxcore.Properties()
         self.cfgProps = pyluxcore.Properties()
 
@@ -109,7 +115,7 @@ class BlenderSceneConverter(object):
         try:
             mesh_definitions = []
 
-            if obj.hide_render:
+            if not is_obj_visible(self.blScene, obj):
                 return mesh_definitions
 
             mesh = obj.to_mesh(self.blScene, True, 'RENDER')
@@ -1116,7 +1122,111 @@ class BlenderSceneConverter(object):
 
             traceback.print_exc()
             return 'LUXBLEND_LUXCORE_CLAY_MATERIAL'
+    
+    def ConvertParamToLuxcoreProperty(self, param):
+        """
+        Convert Luxrender parameters of the form
+        ['float gain', 1.0]
+        to LuxCore property format
+        
+        Returns list of parsed values without type specifier
+        e.g. ['gain', 1.0]
+        """
+        
+        parsed = param[0].split(' ')
+        parsed.pop(0)
+        
+        return [parsed[0], param[1]]
+    
+    def ConvertLight(self, obj):
+        light = obj.data
+        luxcore_name = ToValidLuxCoreName(obj.name)
+        
+        light_params = ParamSet() \
+        .add_float('gain', light.energy) \
+        .add_float('importance', light.luxrender_lamp.importance)
 
+        # Params from light sub-types
+        light_params.update(getattr(light.luxrender_lamp, 'luxrender_lamp_%s' % light.type.lower()).get_paramset(obj))
+        
+        params_converted = []
+        for rawParam in light_params:
+            params_converted.append(self.ConvertParamToLuxcoreProperty(rawParam))
+        
+        params_keyValue = {}
+        for param in params_converted:
+            params_keyValue[param[0]] = param[1]
+
+        # Common light params
+        lux_lamp = getattr(light.luxrender_lamp, 'luxrender_lamp_%s' % light.type.lower())
+        energy = params_keyValue['gain']
+        position = bpy.data.objects[luxcore_name].location
+        importance = params_keyValue['importance']
+
+        if getattr(lux_lamp, 'L_color') and not (hasattr(lux_lamp, 'sunsky_type') and getattr(lux_lamp, 'sunsky_type') != 'distant'):
+            spectrum = getattr(lux_lamp, 'L_color') * energy
+            gain_spectrum = [spectrum[0], spectrum[1], spectrum[2]]
+        else:
+            gain_spectrum = [energy, energy, energy]
+
+        self.scnProps.Set(pyluxcore.Property('scene.lights.' + luxcore_name + '.gain', gain_spectrum))
+        self.scnProps.Set(pyluxcore.Property('scene.lights.' + luxcore_name + '.importance', importance))
+        
+        if light.type == 'SUN':
+            invmatrix = obj.matrix_world.inverted()
+            invmatrix = fix_matrix_order(invmatrix)  # matrix indexing hack
+            sundir = [invmatrix[2][0], invmatrix[2][1], invmatrix[2][2]]
+            
+            sunsky_type = light.luxrender_lamp.luxrender_lamp_sun.sunsky_type
+            legacy_sky = light.luxrender_lamp.luxrender_lamp_sun.legacy_sky
+            
+            if 'sun' in sunsky_type:
+                name = luxcore_name + '_sun'
+                turbidity = params_keyValue['turbidity']
+                
+                self.scnProps.Set(pyluxcore.Property('scene.lights.' + name + '.type', ['sun']))
+                self.scnProps.Set(pyluxcore.Property('scene.lights.' + name + '.turbidity', [turbidity]))
+                self.scnProps.Set(pyluxcore.Property('scene.lights.' + name + '.dir', sundir))
+                
+                if 'relsize' in params_keyValue:
+                    relsize = params_keyValue['relsize']
+                    self.scnProps.Set(pyluxcore.Property('scene.lights.' + name + '.relsize', [relsize]))
+                
+            if 'sky' in sunsky_type:
+                name = luxcore_name + '_sky'
+                turbidity = params_keyValue['turbidity']
+                skyVersion = 'sky' if legacy_sky else 'sky2'
+                
+                self.scnProps.Set(pyluxcore.Property('scene.lights.' + name + '.type', [skyVersion]))
+                self.scnProps.Set(pyluxcore.Property('scene.lights.' + name + '.turbidity', [turbidity]))
+                self.scnProps.Set(pyluxcore.Property('scene.lights.' + name + '.dir', sundir))
+                
+            if sunsky_type == 'distant':
+                distant_dir = [-sundir[0], -sundir[1], -sundir[2]]
+                colorRaw = light.luxrender_lamp.luxrender_lamp_sun.L_color
+                color = [colorRaw[0], colorRaw[1], colorRaw[2]]
+            
+                self.scnProps.Set(pyluxcore.Property('scene.lights.' + luxcore_name + '.type', ['distant']))
+                self.scnProps.Set(pyluxcore.Property('scene.lights.' + luxcore_name + '.color', color))
+                self.scnProps.Set(pyluxcore.Property('scene.lights.' + luxcore_name + '.direction', distant_dir))
+                
+                if 'theta' in params_keyValue:
+                    theta = params_keyValue['theta']
+                    self.scnProps.Set(pyluxcore.Property('scene.lights.' + luxcore_name + '.theta', [theta]))
+
+        elif light.type == 'POINT':
+ #           if getattr(lux_lamp, 'usesphere'):
+ #               print("------------------------", getattr(lux_lamp, 'pointsize'))
+            self.scnProps.Set(pyluxcore.Property('scene.lights.' + luxcore_name + '.type', ['point']))
+            self.scnProps.Set(pyluxcore.Property('scene.lights.' + luxcore_name + '.position', [position[0], position[1], position[2]]))
+            self.scnProps.Set(pyluxcore.Property('scene.lights.' + luxcore_name + '.power', getattr(lux_lamp, 'power')))
+            self.scnProps.Set(pyluxcore.Property('scene.lights.' + luxcore_name + '.efficency', getattr(lux_lamp, 'efficacy')))
+
+
+        else:
+            raise Exception('Unknown lighttype ' + light.type + ' for light: ' + luxcore_name)
+
+        
     def ConvertObject(self, obj):
         # #######################################################################
         # Convert the object geometry
@@ -1144,6 +1254,15 @@ class BlenderSceneConverter(object):
             ####################################################################
             self.scnProps.Set(pyluxcore.Property('scene.objects.' + objName + '.material', [objMatName]))
             self.scnProps.Set(pyluxcore.Property('scene.objects.' + objName + '.ply', ['Mesh-' + objName]))
+            
+        if obj.type == 'LAMP':
+            try:
+                self.ConvertLight(obj)
+            except Exception as err:
+                LuxLog('Light export failed, skipping light: %s\n%s' % (obj.name, err))
+                import traceback
+                traceback.print_exc()
+            
 
     def ConvertCamera(self, imageWidth=None, imageHeight=None):
         blCamera = self.blScene.camera
@@ -1251,12 +1370,14 @@ class BlenderSceneConverter(object):
         ########################################################################
         # Add a sky definition
         ########################################################################
+        '''
         self.scnProps.Set(pyluxcore.Property('scene.lights.sunlight.type', ['sun']))
         self.scnProps.Set(pyluxcore.Property('scene.lights.sunlight.gain', [1.0, 1.0, 1.0]))
         self.scnProps.Set(pyluxcore.Property('scene.lights.sunlight.dir', [0.166974, -0.59908, 0.783085]))
         self.scnProps.Set(pyluxcore.Property('scene.lights.skylight.type', ['sky']))
         self.scnProps.Set(pyluxcore.Property('scene.lights.skylight.gain', [1.0, 1.0, 1.0]))
         self.scnProps.Set(pyluxcore.Property('scene.lights.skylight.dir', [0.166974, -0.59908, 0.783085]))
+        '''
 
         ########################################################################
         # Add dummy material
